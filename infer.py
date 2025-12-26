@@ -14,7 +14,7 @@ def preprocess_det(img, target_size=(640, 640)):
     tensor = torch.from_numpy(img_resized).permute(2, 0, 1).float() / 255.0
     return tensor.unsqueeze(0), (h, w) # Add batch dim
 
-def postprocess_det(cls_scores, bbox_preds, input_shape, orig_shape, score_thr=0.3):
+def postprocess_det(cls_scores, bbox_preds, input_shape, orig_shape, score_thr=0.3, nms_thr=0.5):
     # input_shape: (640, 640)
     # orig_shape: (H, W)
     all_bboxes = []
@@ -47,7 +47,7 @@ def postprocess_det(cls_scores, bbox_preds, input_shape, orig_shape, score_thr=0
     all_scores = torch.cat(all_scores, dim=1)[0]
     
     # NMS
-    det_bboxes, det_scores, det_labels = multiclass_nms(all_bboxes, all_scores, score_thr, 0.5)
+    det_bboxes, det_scores, det_labels = multiclass_nms(all_bboxes, all_scores, score_thr, nms_thr)
     
     # Rescale to original image size
     # input was 640x640, orig was HxW

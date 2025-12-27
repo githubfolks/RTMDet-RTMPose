@@ -207,6 +207,8 @@ marimo/_lsp/
 __marimo__/
 
 custom_dataset/
+custom_dataset_6000/
+annotated_images/
 sample_input/
 sample_output/
 train/

@@ -111,6 +111,11 @@ class YOLODataset(Dataset):
             target['keypoints'] = torch.tensor(keypoints, dtype=torch.float32)
         
         if self.transform:
-            img, target = self.transform(img, target)
+            # For pose transforms that return list of (crop, keypoints) samples
+            result = self.transform(img, target)
+            if isinstance(result, list):
+                return result  # Return list of samples directly
+            else:
+                img, target = result
             
         return img, target

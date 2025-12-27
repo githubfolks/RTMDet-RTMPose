@@ -76,15 +76,14 @@ def calculate_angle(p1, p2, p3):
     return np.degrees(angle)
 
 
-def classify_pose(keypoints, confidence, conf_threshold=0.01):
+def classify_pose(keypoints, confidence, conf_threshold=0.015):
     """
     Classify pose based on keypoint positions and angles.
     
-    Note: conf_threshold is set very low (0.01) to work with models that haven't
-    fully converged. For production use, increase to 0.3 or higher.
     Args:
         keypoints: List of (x, y, conf) tuples for 17 COCO keypoints
         confidence: Array of confidence scores
+        conf_threshold: Minimum confidence to consider a keypoint
         conf_threshold: Minimum confidence to consider a keypoint
         
     Returns:
@@ -134,9 +133,30 @@ def classify_pose(keypoints, confidence, conf_threshold=0.01):
             angle = calculate_angle(kpts[hip_idx], kpts[knee_idx], kpts[ankle_idx])
             knee_angles.append(angle)
     
-    avg_knee_angle = np.mean(knee_angles) if knee_angles else 180
-    details['avg_knee_angle'] = avg_knee_angle
-    details['hip_knee_vert'] = hip_knee_vert
+    avg_knee_angle = np.mean(knee_angles) if knee_angles else None
+    details['avg_knee_angle'] = avg_knee_angle if avg_knee_angle is not None else 180
+    
+    # Calculate hip-knee vertical distance (safe)
+    hip_visible = confs[L_HIP] >= conf_threshold or confs[R_HIP] >= conf_threshold
+    knee_visible = confs[L_KNEE] >= conf_threshold or confs[R_KNEE] >= conf_threshold
+    
+    hip_knee_vert = None
+    if hip_visible and knee_visible:
+        # Use visible points only or average if both
+        h_ys = []
+        if confs[L_HIP] >= conf_threshold: h_ys.append(kpts[L_HIP][1])
+        if confs[R_HIP] >= conf_threshold: h_ys.append(kpts[R_HIP][1])
+        hip_y = np.mean(h_ys)
+        
+        k_ys = []
+        if confs[L_KNEE] >= conf_threshold: k_ys.append(kpts[L_KNEE][1])
+        if confs[R_KNEE] >= conf_threshold: k_ys.append(kpts[R_KNEE][1])
+        knee_y = np.mean(k_ys)
+        
+        hip_knee_vert = knee_y - hip_y
+        details['hip_knee_vert'] = hip_knee_vert
+    else:
+        details['hip_knee_vert'] = 'N/A'
     
     # Calculate leg spread (horizontal distance between ankles)
     leg_spread = 0
@@ -151,17 +171,26 @@ def classify_pose(keypoints, confidence, conf_threshold=0.01):
         ankle_y = kpts[L_ANKLE][1] if confs[L_ANKLE] >= conf_threshold else kpts[R_ANKLE][1]
         body_height = max(abs(ankle_y - shoulder_y), 1)
         details['body_height'] = body_height
-    
+    elif hip_knee_vert is not None:
+        # Fallback estimation if ankles missing but knees present
+        body_height = max(abs(hip_knee_vert) * 2.5, 1)
+
     # Leg spread ratio
     spread_ratio = leg_spread / body_height if body_height > 0 else 0
     details['spread_ratio'] = spread_ratio
     
     # ---- Classification Logic ----
     
-    # SITTING: Knees are bent significantly (angle < 120°) AND knees close to hips vertically
-    # In sitting position, hip-knee vertical distance is small or negative
-    if avg_knee_angle < 130 and hip_knee_vert < body_height * 0.25:
-        return 'sitting', details
+    # SITTING: Knees are bent significantly (angle < 120°) OR knees close to hips vertically
+    # If angle is known, use it. If not, rely on vertical distance if reliable.
+    is_sitting_angle = (avg_knee_angle is not None and avg_knee_angle < 130)
+    is_sitting_vert = (hip_knee_vert is not None and hip_knee_vert < body_height * 0.1)
+    
+    if is_sitting_angle or (avg_knee_angle is None and is_sitting_vert):
+         return 'sitting', details
+    
+    # Use default angle 180 if unknown for further checks
+    check_angle = avg_knee_angle if avg_knee_angle is not None else 180
     
     # RUNNING: Wide leg spread + potentially bent arms
     if spread_ratio > 0.35:
@@ -182,7 +211,7 @@ def classify_pose(keypoints, confidence, conf_threshold=0.01):
         return 'walking', details
     
     # STANDING: Legs close together, upright posture
-    if avg_knee_angle > 150 and spread_ratio <= 0.12:
+    if check_angle > 150 and spread_ratio <= 0.12:
         return 'standing', details
     
     # Default to standing if we can't determine otherwise
@@ -401,7 +430,7 @@ def main():
     parser.add_argument('--input', type=str, default='sample_input', help='Input directory or image path')
     parser.add_argument('--output', type=str, default='sample_output', help='Output directory')
     parser.add_argument('--det_weights', type=str, default='train/weights/rtmdet_custom.pth')
-    parser.add_argument('--pose_weights', type=str, default='train/weights/rtmpose_custom.pth')
+    parser.add_argument('--pose_weights', type=str, default='train/weights/rtmpose_best.pth')
     parser.add_argument('--score_thr', type=float, default=0.16)
     parser.add_argument('--nms_thr', type=float, default=0.1)
     parser.add_argument('--no_keypoints', action='store_true', help='Hide keypoint visualization')

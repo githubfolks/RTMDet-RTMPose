@@ -210,3 +210,4 @@ custom_dataset/
 sample_input/
 sample_output/
 train/
+training_log.txt

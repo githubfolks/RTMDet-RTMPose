@@ -1,0 +1,51 @@
+# RTMDet Training Configuration (Object Detection)
+# Script: train_det.py
+# PURPOSE: Stabilize training on Apple MPS & eliminate mid-epoch NaNs
+
+detection:
+  model:
+    architecture: "RTMDet-s"
+    input_size: [640, 640]
+
+  data:
+    root: "dataset_coco"
+    train_images: "train/images"
+    train_annotations: "train/train.json"
+    batch_size: 16
+    num_workers: 8
+    persistent_workers: true
+
+  training:
+    epochs: 80
+    device: "mps"
+    work_dir: "train/weights_rtmdet_s"
+    resume: true
+    resume_from: "train/weights_scratch/rtmdet_custom_epoch_46.pth"  # ← adjust if needed
+
+    # 🔒 Stabilization controls
+    freeze_backbone: true        # CRITICAL: stop backbone gradient spikes
+    freeze_at_epoch: 45
+
+  optimization:
+    optimizer: "AdamW"
+
+    learning_rate:
+      base_lr: 1.5e-4            # Capped for MPS safety
+      scheduler: "CosineAnnealing"
+      warmup_steps: 300
+      min_lr: 1.0e-6
+
+    weight_decay: 0.05
+    gradient_clipping: 0.3       # 🔥 MOST IMPORTANT FIX
+
+    # 🔕 Disable mixed precision on MPS
+    fp16: false
+    amp: false
+
+  # 🚫 Augmentation stabilizers
+  augmentation:
+    mosaic_prob: 0.0             # Disable Mosaic immediately
+    close_mosaic_epochs: 40
+    mixup_prob: 0.0
+
+

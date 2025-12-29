@@ -1,0 +1,34 @@
+# RTMPose Training Configuration (Pose Estimation)
+# Script: train_pose.py
+pose:
+  model:
+    architecture: "RTMPose-s"
+    input_size: [192, 256]
+
+  data:
+    root: "dataset_coco"
+    train_images: "train/images"
+    train_annotations: "train/train.json"
+    batch_size: 16                    # Safe on 24GB M5
+    num_workers: 8                    # Improve data pipeline throughput
+    persistent_workers: true
+    preprocessing:
+      crop_padding_ratio: 0.25
+
+  training:
+    epochs: 40                        # Enough with pretrained weights
+    device: "mps"
+    work_dir: "train/weights_rtmpose_s"
+    pretrained: true
+    load_from: "rtmpose_s_simcc_coco.pth"
+
+  optimization:
+    optimizer: "AdamW"
+    learning_rate:
+      base_lr: 1.0e-3                 # Correct for SimCC
+      scheduler: "CosineAnnealing"    # Faster convergence than Constant
+      warmup_steps: 200
+      min_lr: 1.0e-5
+    weight_decay: 0.05
+    gradient_clipping: 1.0            # Mandatory for MPS
+    loss_function: "SimCC"

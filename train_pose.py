@@ -8,6 +8,7 @@ import argparse
 import torch.nn.functional as F
 import datetime
 import os
+import yaml
 
 import cv2
 import numpy as np
@@ -107,6 +108,59 @@ def collate_fn(batch):
     
     return torch.stack(imgs), torch.stack(kpts_targets)
 
+# ============================================
+# LOSS FUNCTION
+# ============================================
+
+def simcc_loss(pred_simcc_x, pred_simcc_y, gt_kpts, simcc_split_ratio=2.0, sigma=6.0, use_soft_label=True):
+    """
+    SimCC loss (copied from train_pose_improved.py).
+    """
+    B, K, W_bins = pred_simcc_x.shape
+    _, _, H_bins = pred_simcc_y.shape
+    device = pred_simcc_x.device
+    
+    valid_mask = gt_kpts[..., 2] > 0
+    
+    if valid_mask.sum() == 0:
+        return torch.tensor(0.0, device=device, requires_grad=True)
+    
+    gt_x = gt_kpts[..., 0] * simcc_split_ratio
+    gt_y = gt_kpts[..., 1] * simcc_split_ratio
+    
+    if use_soft_label:
+        # Generate Gaussian soft labels
+        x_indices = torch.arange(W_bins, device=device).float()
+        y_indices = torch.arange(H_bins, device=device).float()
+        
+        # (B, K, 1) - (1, 1, W_bins) -> (B, K, W_bins)
+        gt_x_exp = gt_x.unsqueeze(-1)
+        gt_y_exp = gt_y.unsqueeze(-1)
+        
+        target_x = torch.exp(-((x_indices - gt_x_exp) ** 2) / (2 * sigma ** 2))
+        target_y = torch.exp(-((y_indices - gt_y_exp) ** 2) / (2 * sigma ** 2))
+        
+        # Normalize to sum to 1
+        target_x = target_x / (target_x.sum(dim=-1, keepdim=True) + 1e-8)
+        target_y = target_y / (target_y.sum(dim=-1, keepdim=True) + 1e-8)
+        
+        # KL divergence loss
+        log_pred_x = F.log_softmax(pred_simcc_x, dim=-1)
+        log_pred_y = F.log_softmax(pred_simcc_y, dim=-1)
+        
+        loss_x = F.kl_div(log_pred_x, target_x, reduction='none').sum(dim=-1)
+        loss_y = F.kl_div(log_pred_y, target_y, reduction='none').sum(dim=-1)
+    else:
+        # Simple cross entropy
+        gt_x = gt_x.clamp(0, W_bins-1).long()
+        gt_y = gt_y.clamp(0, H_bins-1).long()
+        
+        loss_x = F.cross_entropy(pred_simcc_x.permute(0, 2, 1), gt_x, reduction='none')
+        loss_y = F.cross_entropy(pred_simcc_y.permute(0, 2, 1), gt_y, reduction='none')
+    
+    loss = (loss_x * valid_mask + loss_y * valid_mask).sum() / (valid_mask.sum() + 1e-6)
+    return loss
+
 
 def train(item_dict):
     data_root = item_dict['data_root']
@@ -154,38 +208,51 @@ def train(item_dict):
     # Model
     model = RTMPose('s', input_size=(256, 192)).to(device)
     
-    if resume_path and os.path.exists(resume_path):
-        log(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Resuming from {resume_path}...")
-        try:
-            checkpoint = torch.load(resume_path, map_location=device)
-            if isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
-                 model.load_state_dict(checkpoint['state_dict'])
-                 log("Resumed model weights from dict checkpoint.")
-            else:
-                 model.load_state_dict(checkpoint)
-                 log("Resumed from weights-only checkpoint.")
-        except Exception as e:
-            log(f"Warning: Failed to resume: {e}")
-            
     model.train()
     
     # Learning rate from args
     lr = item_dict.get('lr', 0.001)
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=0.05)
-    
+
     start_epoch = 0
     if resume_path and os.path.exists(resume_path):
         try:
-            checkpoint = torch.load(resume_path, map_location=device)
+            checkpoint = torch.load(resume_path, map_location=device, weights_only=False)
             if isinstance(checkpoint, dict):
+                if 'state_dict' in checkpoint:
+                     model.load_state_dict(checkpoint['state_dict'])
+                     log("Resumed model weights from dict checkpoint.")
+                elif isinstance(checkpoint, dict) and not 'state_dict' in checkpoint:
+                    pass # Handled below
+                else:
+                     model.load_state_dict(checkpoint)
+                     log("Resumed from weights-only checkpoint.")
+                     
                 if 'optimizer' in checkpoint:
                      optimizer.load_state_dict(checkpoint['optimizer'])
                      log("Resumed optimizer state.")
                 if 'epoch' in checkpoint:
                      start_epoch = checkpoint['epoch']
                      log(f"Resuming training from epoch {start_epoch + 1}.")
-        except:
+        except Exception as e:
+            log(f"Warning: Failed to resume: {e}")
             pass
+    
+    # If not resuming, check for load_from (pretrained weights)
+    if not (resume_path and os.path.exists(resume_path)):
+        load_from = item_dict.get('load_from', None)
+        if load_from and os.path.exists(load_from):
+            log(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Loading pretrained weights from {load_from}...")
+            try:
+                checkpoint = torch.load(load_from, map_location=device, weights_only=False)
+                if isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
+                     model.load_state_dict(checkpoint['state_dict'], strict=False)
+                     log("Loaded model weights from dict checkpoint.")
+                else:
+                     model.load_state_dict(checkpoint, strict=False)
+                     log("Loaded model weights from weights-only checkpoint.")
+            except Exception as e:
+                log(f"Warning: Failed to load pretrained weights: {e}")
     
     log(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Starting Pose Training from epoch {start_epoch + 1}...")
     for epoch in range(start_epoch, epochs):
@@ -234,12 +301,68 @@ def train(item_dict):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--data_root', type=str, required=True)
-    parser.add_argument('--batch_size', type=int, default=8)
-    parser.add_argument('--epochs', type=int, default=50) # Increased to 50
+    parser.add_argument('--config', type=str, default=None, help='Path to YAML config file')
+    parser.add_argument('--data_root', type=str, default=None)
+    parser.add_argument('--batch_size', type=int, default=None) 
+    parser.add_argument('--epochs', type=int, default=None) 
     parser.add_argument('--resume', type=str, default=None, help='Path to checkpoint to resume from')
-    parser.add_argument('--work_dir', type=str, default='train/weights', help='Directory to save weights')
-    parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate')
+    parser.add_argument('--work_dir', type=str, default=None, help='Directory to save weights')
+    parser.add_argument('--lr', type=float, default=None, help='Learning rate')
     args = parser.parse_args()
     
-    train(vars(args))
+    cfg_args = {}
+    
+    # Defaults
+    final_args = {
+        'data_root': 'dataset_coco',
+        'batch_size': 16,
+        'epochs': 50,
+        'resume': None,
+        'work_dir': 'train/weights',
+        'lr': 1e-3
+    }
+
+    if args.config:
+        with open(args.config, 'r') as f:
+            cfg = yaml.safe_load(f)
+            if 'pose' in cfg:
+                pose_cfg = cfg['pose']
+                
+                # Map config to args
+                if 'data' in pose_cfg:
+                    if 'root' in pose_cfg['data']:
+                        cfg_args['data_root'] = pose_cfg['data']['root']
+                    if 'batch_size' in pose_cfg['data']:
+                        cfg_args['batch_size'] = pose_cfg['data']['batch_size']
+                
+                if 'training' in pose_cfg:
+                    if 'epochs' in pose_cfg['training']:
+                        cfg_args['epochs'] = pose_cfg['training']['epochs']
+                    if 'work_dir' in pose_cfg['training']:
+                        cfg_args['work_dir'] = pose_cfg['training']['work_dir']
+                    if 'resume' in pose_cfg['training']:
+                        cfg_args['resume'] = pose_cfg['training']['resume']
+                    if 'load_from' in pose_cfg['training']:
+                         cfg_args['load_from'] = pose_cfg['training']['load_from']
+                
+                if 'optimization' in pose_cfg and 'learning_rate' in pose_cfg['optimization']:
+                     if 'base_lr' in pose_cfg['optimization']['learning_rate']:
+                         cfg_args['lr'] = pose_cfg['optimization']['learning_rate']['base_lr']
+
+    # Update defaults with config values
+    final_args.update(cfg_args)
+    
+    # Override with command line args if they are not None
+    cmd_args = {k: v for k, v in vars(args).items() if v is not None}
+    final_args.update(cmd_args)
+    
+    # Check required
+    if not final_args.get('data_root'):
+         raise ValueError("data_root must be specified either in config or via command line")
+
+    # Clean up non-training keys
+    if 'config' in final_args:
+        del final_args['config']
+        
+    print(f"Training with arguments: {final_args}")
+    train(final_args)

@@ -1,5 +1,5 @@
 import torch
-print(f"DEBUG: Top of script. CUDA Available? {torch.cuda.is_available()}", flush=True)
+
 
 import torch.optim as optim
 from torch.utils.data import DataLoader
@@ -11,8 +11,9 @@ import os
 import cv2
 import numpy as np
 import datetime
+import yaml
 
-print(f"DEBUG: After imports. CUDA Available? {torch.cuda.is_available()}", flush=True)
+
 
 
 # Transform moved to global scope for multiprocessing
@@ -112,12 +113,7 @@ def train(item_dict):
     # Model
     model = RTMDet('s').to(device)
     
-    if resume_path and os.path.exists(resume_path):
-        print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Resuming from {resume_path}...")
-        try:
-            model.load_state_dict(torch.load(resume_path, map_location=device))
-        except Exception as e:
-            print(f"Warning: Failed to resume: {e}")
+    model = RTMDet('s').to(device)
             
     model.train()
     
@@ -126,12 +122,60 @@ def train(item_dict):
     base_lr = item_dict.get('lr', 1e-5)
     optimizer = optim.AdamW(model.parameters(), lr=base_lr, weight_decay=0.05)
     
+    start_epoch = 0
+    
+    if resume_path and os.path.exists(resume_path):
+        try:
+             checkpoint = torch.load(resume_path, map_location=device, weights_only=False)
+             
+             # 1. Load Model Weights
+             if isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
+                 model.load_state_dict(checkpoint['state_dict'])
+                 print("Resumed model weights from dict checkpoint.")
+             else:
+                 # Fallback for old/plain weights
+                 model.load_state_dict(checkpoint)
+             
+             # 2. Load Optimizer (if dict)
+             if isinstance(checkpoint, dict) and 'optimizer' in checkpoint:
+                 optimizer.load_state_dict(checkpoint['optimizer'])
+                 print("Resumed optimizer state.")
+             
+             # 3. Load Epoch (if dict)
+             if isinstance(checkpoint, dict) and 'epoch' in checkpoint:
+                 start_epoch = checkpoint['epoch']
+                 print(f"Resuming training from epoch {start_epoch + 1}.")
+                 
+        except Exception as e:
+             print(f"Warning: Issue parsing checkpoint for resume: {e}")
+             print("Falling back to random init (or partial load) and starting from epoch 0.")
+             start_epoch = 0
+
+    # If not resuming, check for load_from (pretrained weights)
+    if not (resume_path and os.path.exists(resume_path)):
+        load_from = item_dict.get('load_from', None)
+        if load_from and os.path.exists(load_from):
+            print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Loading pretrained weights from {load_from}...")
+            try:
+                checkpoint = torch.load(load_from, map_location=device, weights_only=False)
+                if isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
+                     model.load_state_dict(checkpoint['state_dict'], strict=False)
+                     print("Loaded model weights from dict checkpoint.")
+                else:
+                     model.load_state_dict(checkpoint, strict=False)
+                     print("Loaded model weights from weights-only checkpoint.")
+            except Exception as e:
+                print(f"Warning: Failed to load pretrained weights: {e}")
+
     # Learning rate warmup
     warmup_steps = 500
     
-    print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Starting training...")
-    global_step = 0
-    for epoch in range(epochs):
+    print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Starting training from epoch {start_epoch + 1}...")
+    
+    # Calculate global step based on resumed epoch
+    global_step = start_epoch * len(dataloader)
+    
+    for epoch in range(start_epoch, epochs):
         total_loss = 0
         valid_steps = 0
         for i, (imgs, gt_bboxes, gt_labels) in enumerate(dataloader):
@@ -145,6 +189,16 @@ def train(item_dict):
                 warmup_lr = base_lr * (global_step + 1) / warmup_steps
                 for param_group in optimizer.param_groups:
                     param_group['lr'] = warmup_lr
+            
+            # Cosine Annealing (Manual implementation to work with per-step warmup)
+            # Or use torch.optim.lr_scheduler.CosineAnnealingLR at epoch level?
+            # Let's use simple cosine decay at step level after warmup:
+            else:
+                progress = (global_step - warmup_steps) / (epochs * len(dataloader) - warmup_steps)
+                progress = min(progress, 1.0)
+                cosine_lr = base_lr * 0.5 * (1 + np.cos(np.pi * progress))
+                for param_group in optimizer.param_groups:
+                    param_group['lr'] = cosine_lr
             
             optimizer.zero_grad()
             
@@ -214,13 +268,72 @@ def train(item_dict):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--data_root', type=str, required=True)
-    parser.add_argument('--batch_size', type=int, default=8)
-    parser.add_argument('--epochs', type=int, default=100) # Increased for scratch training
+    parser.add_argument('--config', type=str, default=None, help='Path to YAML config file')
+    parser.add_argument('--data_root', type=str, default=None)
+    parser.add_argument('--batch_size', type=int, default=None) 
+    parser.add_argument('--epochs', type=int, default=None) 
     parser.add_argument('--resume', type=str, default=None, help='Path to checkpoint to resume from')
-    parser.add_argument('--work_dir', type=str, default='train/weights_scratch', help='Directory to save weights')
-    parser.add_argument('--device', type=str, default='auto', help='Device to use (auto, cuda, mps, cpu)')
-    parser.add_argument('--lr', type=float, default=5e-5, help='Learning rate')
+    parser.add_argument('--work_dir', type=str, default=None, help='Directory to save weights')
+    parser.add_argument('--device', type=str, default=None, help='Device to use (auto, cuda, mps, cpu)')
+    parser.add_argument('--lr', type=float, default=None, help='Learning rate')
     args = parser.parse_args()
     
-    train(vars(args))
+    cfg_args = {}
+    
+    # Defaults
+    final_args = {
+        'data_root': 'dataset_coco', # Default if nothing else specifies
+        'batch_size': 16,
+        'epochs': 100,
+        'resume': None,
+        'work_dir': 'train/weights_scratch',
+        'device': 'auto',
+        'lr': 5e-5
+    }
+
+    if args.config:
+        with open(args.config, 'r') as f:
+            cfg = yaml.safe_load(f)
+            if 'detection' in cfg:
+                det_cfg = cfg['detection']
+                
+                # Map config to args
+                if 'data' in det_cfg:
+                    if 'root' in det_cfg['data']:
+                        cfg_args['data_root'] = det_cfg['data']['root']
+                    if 'batch_size' in det_cfg['data']:
+                        cfg_args['batch_size'] = det_cfg['data']['batch_size']
+                
+                if 'training' in det_cfg:
+                    if 'epochs' in det_cfg['training']:
+                        cfg_args['epochs'] = det_cfg['training']['epochs']
+                    if 'device' in det_cfg['training']:
+                        cfg_args['device'] = det_cfg['training']['device']
+                    if 'work_dir' in det_cfg['training']:
+                        cfg_args['work_dir'] = det_cfg['training']['work_dir']
+                    if 'resume' in det_cfg['training']:
+                        cfg_args['resume'] = det_cfg['training']['resume']
+                    if 'load_from' in det_cfg['training']:
+                        cfg_args['load_from'] = det_cfg['training']['load_from']
+                
+                if 'optimization' in det_cfg and 'learning_rate' in det_cfg['optimization']:
+                     if 'base_lr' in det_cfg['optimization']['learning_rate']:
+                         cfg_args['lr'] = det_cfg['optimization']['learning_rate']['base_lr']
+
+    # Update defaults with config values
+    final_args.update(cfg_args)
+    
+    # Override with command line args if they are not None
+    cmd_args = {k: v for k, v in vars(args).items() if v is not None}
+    final_args.update(cmd_args)
+    
+    # Check required
+    if not final_args.get('data_root'):
+         raise ValueError("data_root must be specified either in config or via command line")
+
+    # Clean up non-training keys if any (like 'config')
+    if 'config' in final_args:
+        del final_args['config']
+        
+    print(f"Training with arguments: {final_args}")
+    train(final_args)

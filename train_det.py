@@ -4,7 +4,8 @@ print(f"DEBUG: Top of script. CUDA Available? {torch.cuda.is_available()}", flus
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from models.rtmdet import RTMDet
-from data.yolo import YOLODataset
+
+from data.coco_det import COCODetDataset
 import argparse
 import os
 import cv2
@@ -59,28 +60,51 @@ def train(item_dict):
     work_dir = item_dict.get('work_dir', 'train/weights')
     
     os.makedirs(work_dir, exist_ok=True)
+    
+    # Setup logging
+    log_file = os.path.join(work_dir, 'training_det_log.txt')
+    def log(msg):
+        print(msg)
+        with open(log_file, 'a') as f:
+            f.write(msg + '\n')
 
     
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA not detected. Please check your environment or drivers.")
+    requested_device = item_dict.get('device', 'auto')
     
-    device = torch.device('cuda')
-    print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Training on device: {device}")
-    print(f"GPU: {torch.cuda.get_device_name(0)}")
+    if requested_device != 'auto':
+        device = torch.device(requested_device)
+        print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Training on user-requested device: {device}")
+    else:
+        # Device selection: CUDA > MPS (Mac) > CPU
+        if torch.cuda.is_available():
+            device = torch.device('cuda')
+            print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Training on device: {device}")
+            print(f"GPU: {torch.cuda.get_device_name(0)}")
+
+        elif torch.backends.mps.is_available():
+            # RTMDet is currently unstable on MPS (NaN loss). Defaulting to CPU for safety.
+            print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] MPS detected but unstable for RTMDet. Defaulting to CPU.")
+            device = torch.device('cpu')
+        else:
+            device = torch.device('cpu')
+            print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Training on device: {device}")
     
     # Transform
     # Transform defined globally now
 
     # Dataset
-    # Assuming standard structure: data_root/images/train
-    dataset = YOLODataset(data_root, split='train', use_pose=False, transform=ResizeTransform(size=(640, 640)), cache_ram=True)
+    # COCO Format
+    img_dir = os.path.join(data_root, 'train', 'images')
+    ann_file = os.path.join(data_root, 'train', 'train.json')
     
+    dataset = COCODetDataset(img_dir, ann_file, transform=ResizeTransform(size=(640, 640)))
+    
+
     # Collate function to handle list of tensors
     # Collate function defined globally now
         
-    # When using RAM Cache on Windows, num_workers must be 0 to avoid expensive pickling of the huge dataset object
-    num_workers = 0 if dataset.cache_ram else 4
-    persistent_workers = False if num_workers == 0 else True
+    num_workers = 4
+    persistent_workers = True
     
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn, 
                             num_workers=num_workers, pin_memory=True, persistent_workers=persistent_workers)
@@ -97,16 +121,30 @@ def train(item_dict):
             
     model.train()
     
-    optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=0.05)
+
+    # Lower learning rate to prevent gradient explosion on MPS
+    base_lr = item_dict.get('lr', 1e-5)
+    optimizer = optim.AdamW(model.parameters(), lr=base_lr, weight_decay=0.05)
+    
+    # Learning rate warmup
+    warmup_steps = 500
     
     print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Starting training...")
+    global_step = 0
     for epoch in range(epochs):
         total_loss = 0
+        valid_steps = 0
         for i, (imgs, gt_bboxes, gt_labels) in enumerate(dataloader):
             imgs = imgs.to(device)
             # gt_bboxes/labels are lists of tensors, move them to device when needed in loss
             gt_bboxes = [b.to(device) for b in gt_bboxes]
             gt_labels = [l.to(device) for l in gt_labels]
+            
+            # Warmup learning rate
+            if global_step < warmup_steps:
+                warmup_lr = base_lr * (global_step + 1) / warmup_steps
+                for param_group in optimizer.param_groups:
+                    param_group['lr'] = warmup_lr
             
             optimizer.zero_grad()
             
@@ -114,30 +152,75 @@ def train(item_dict):
             
             loss_dict = model.head.loss(cls_scores, bbox_preds, gt_bboxes, gt_labels)
             
+
             loss = loss_dict['loss_cls'] + loss_dict['loss_bbox']
+            
+            # Check for NaN loss and skip batch if detected
+            if torch.isnan(loss) or torch.isinf(loss):
+                print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Warning: NaN/Inf loss detected at step {i}, skipping batch...")
+                optimizer.zero_grad()
+                global_step += 1
+                continue
+            
             loss.backward()
+            
+            # Replace NaN/Inf gradients with zeros to allow partial learning
+            nan_grad_count = 0
+            for param in model.parameters():
+                if param.grad is not None:
+                    nan_mask = torch.isnan(param.grad) | torch.isinf(param.grad)
+                    if nan_mask.any():
+                        param.grad = torch.where(nan_mask, torch.zeros_like(param.grad), param.grad)
+                        nan_grad_count += 1
+            
+            if nan_grad_count > 0 and i % 100 == 0:
+                print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Fixed {nan_grad_count} NaN gradients at step {i}...")
+            
+            # Gradient Clipping - more aggressive for stability
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            
             optimizer.step()
             
             total_loss += loss.item()
+            valid_steps += 1
+            global_step += 1
             
             if i % 10 == 0:
-                print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Epoch [{epoch+1}/{epochs}], Step [{i}/{len(dataloader)}], Loss: {loss.item():.4f}")
+                current_lr = optimizer.param_groups[0]['lr']
+                print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Epoch [{epoch+1}/{epochs}], Step [{i}/{len(dataloader)}], Loss: {loss.item():.4f}, LR: {current_lr:.2e}")
                 
-        print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Epoch {epoch+1} Complete. Avg Loss: {total_loss/len(dataloader):.4f}")
+        avg_loss = total_loss/max(valid_steps, 1)
+        log(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Epoch {epoch+1} Complete. Avg Loss: {avg_loss:.4f}")
         
+
         # Save every epoch
-        save_path = os.path.join(work_dir, 'rtmdet_custom.pth')
-        torch.save(model.state_dict(), save_path)
+        # Save checkpoint with epoch number
+        ckpt_name = f'rtmdet_custom_epoch_{epoch+1}.pth'
+        save_path = os.path.join(work_dir, ckpt_name)
+        checkpoint = {
+            'epoch': epoch + 1,
+            'state_dict': model.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'loss': avg_loss
+        }
+        torch.save(checkpoint, save_path)
+        
+        # Also update the 'latest' file for easy resumption
+        latest_path = os.path.join(work_dir, 'rtmdet_custom.pth')
+        torch.save(checkpoint, latest_path)
         
     print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Training Complete. Model saved to {save_path}.")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--data_root', type=str, required=True)
     parser.add_argument('--batch_size', type=int, default=8)
-    parser.add_argument('--epochs', type=int, default=50) # Increased to 50
+    parser.add_argument('--epochs', type=int, default=100) # Increased for scratch training
     parser.add_argument('--resume', type=str, default=None, help='Path to checkpoint to resume from')
-    parser.add_argument('--work_dir', type=str, default='train/weights', help='Directory to save weights')
+    parser.add_argument('--work_dir', type=str, default='train/weights_scratch', help='Directory to save weights')
+    parser.add_argument('--device', type=str, default='auto', help='Device to use (auto, cuda, mps, cpu)')
+    parser.add_argument('--lr', type=float, default=5e-5, help='Learning rate')
     args = parser.parse_args()
     
     train(vars(args))

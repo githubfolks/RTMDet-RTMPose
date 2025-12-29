@@ -17,7 +17,7 @@ from infer import preprocess_det, postprocess_det
 # ============================================
 
 # Confidence thresholds
-CONF_HIDE_THRESHOLD = 0.5   # Hide keypoints below this
+CONF_HIDE_THRESHOLD = 0.01   # Hide keypoints below this
 CONF_HIGH_THRESHOLD = 0.7   # Green - high confidence
 CONF_MED_THRESHOLD = 0.6    # Yellow - medium confidence
 
@@ -431,7 +431,7 @@ def main():
     parser.add_argument('--output', type=str, default='sample_output', help='Output directory')
     parser.add_argument('--det_weights', type=str, default='train/weights/rtmdet_custom.pth')
     parser.add_argument('--pose_weights', type=str, default='train/weights/rtmpose_best.pth')
-    parser.add_argument('--score_thr', type=float, default=0.16)
+    parser.add_argument('--score_thr', type=float, default=0.25)
     parser.add_argument('--nms_thr', type=float, default=0.1)
     parser.add_argument('--no_keypoints', action='store_true', help='Hide keypoint visualization')
     parser.add_argument('--no_pose_label', action='store_true', help='Hide pose classification label')

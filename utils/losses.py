@@ -6,23 +6,25 @@ from .box_ops import bbox_iou
 def quality_focal_loss(pred, target, beta=2.0):
     """
     Quality Focal Loss (QFL) is a generalization of Focal Loss.
-    pred: (N, C), sigmoid applied.
+    pred: (N, C), raw logits (sigmoid NOT applied).
     target: (N, C), 0-1 quality (IoU) for positives, 0 for negatives.
+    
+    Uses stable BCE computation.
     """
     assert pred.shape == target.shape
-    pred_sigmoid = pred.sigmoid() if not pred.min() >= 0 else pred # Assuming raw logits input usually, but let's standardization
     
-    # QFL: -|y - p|^beta * ((1-y)*log(1-p) + y*log(p))
-    # Simplify: Cross Entropy with dynamic scaling factor |y - p|^beta
+    # Apply sigmoid
+    pred_sigmoid = pred.sigmoid()
     
-    scale_factor = (pred_sigmoid - target).abs().pow(beta)
+    # QFL: -|y - p|^beta * BCE
+    # Scale factor: |y - p|^beta where y is target (0 or IoU), p is predicted prob
+    scale_factor = (pred_sigmoid.detach() - target).abs().pow(beta)
     
-    # Binary Cross Entropy with Logits
-    # We can use F.binary_cross_entropy_with_logits if we pass logits
-    # But scaling factor depends on sigmoid.
+    # Use stable BCE with logits
+    bce = F.binary_cross_entropy_with_logits(pred, target, reduction='none')
     
-    # Using BCE with reduction='none'
-    loss = F.binary_cross_entropy_with_logits(pred, target, reduction='none') * scale_factor
+    loss = scale_factor * bce
+    
     return loss.sum()
 
 def giou_loss(pred, target, eps=1e-7):
@@ -128,7 +130,7 @@ class SimOTAAssigner:
         cost_cls = F.binary_cross_entropy_with_logits(gt_scores, torch.ones_like(gt_scores), reduction='none')
         # Simplified: -log(score). 
         
-        cost_iou = -torch.log(iou + 1e-7)
+        cost_iou = -torch.log(iou.clamp(min=1e-6))
         
         cost = self.cls_weight * cost_cls + self.iou_weight * cost_iou + 10000.0 * (1 - (iou > 0).float()) # Penalize 0 iou
         

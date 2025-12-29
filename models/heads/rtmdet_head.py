@@ -39,9 +39,19 @@ class RTMDetHead(nn.Module):
                 cls_conv.append(ConvModule(in_channels, feat_channels, 3, 1, 1))
                 reg_conv.append(ConvModule(in_channels, feat_channels, 3, 1, 1))
             
+
             self.cls_convs.append(nn.Sequential(*cls_conv, nn.Conv2d(feat_channels, num_classes, 3, 1, 1)))
             self.reg_convs.append(nn.Sequential(*reg_conv, nn.Conv2d(feat_channels, 4, 3, 1, 1)))
             
+        self.init_weights()
+            
+    def init_weights(self):
+        # Initialize CLS branch with bias -4.59 (prob ~0.01)
+        for m in self.cls_convs:
+            if isinstance(m, nn.Sequential):
+                # Last layer is conv
+                nn.init.constant_(m[-1].bias, -4.59)
+                
     def forward(self, feats):
         cls_scores = []
         bbox_preds = []
@@ -49,6 +59,13 @@ class RTMDetHead(nn.Module):
         for i, x in enumerate(feats):
             cls_out = self.cls_convs[i](x)
             reg_out = self.reg_convs[i](x)
+            
+
+            # Use softplus instead of exp for numerical stability
+            # softplus(x) = log(1 + exp(x)), which is bounded and more stable
+            # Clamp input first to prevent overflow
+            reg_out = reg_out.clamp(min=-20, max=20)
+            reg_out = torch.nn.functional.softplus(reg_out, beta=1, threshold=20)
             
             cls_scores.append(cls_out)
             bbox_preds.append(reg_out)
@@ -73,7 +90,7 @@ class RTMDetHead(nn.Module):
         # Generate anchors on the fly for all levels
         for i, stride in enumerate(self.strides):
              cls_feat = cls_scores[i] # (B, C, H, W)
-             reg_feat = bbox_preds[i] # (B, 4, H, W)
+             reg_feat = bbox_preds[i] # (B, 4, H, W) -> Already EXP'd in forward
              
              B, C, H, W = cls_feat.shape
              
@@ -154,6 +171,10 @@ class RTMDetHead(nn.Module):
         if num_pos_total > 0:
             total_loss_cls /= num_pos_total
             total_loss_bbox /= B # Already mean inside giou? usually per image norm
+        else:
+            # No positive samples in batch - return small placeholder loss
+            total_loss_cls = torch.tensor(0.1, device=device, requires_grad=True)
+            total_loss_bbox = torch.tensor(0.1, device=device, requires_grad=True)
         
         return {"loss_cls": total_loss_cls, "loss_bbox": total_loss_bbox}
 

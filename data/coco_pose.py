@@ -61,7 +61,11 @@ class COCOPoseDataset(Dataset):
             'bboxes': torch.tensor(bboxes, dtype=torch.float32)
         }
         
+
         if self.transform:
-            img, target = self.transform(img, target)
+            res = self.transform(img, target)
+            if isinstance(res, list):
+                return res
+            img, target = res
             
         return img, target

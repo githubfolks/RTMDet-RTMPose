@@ -2,7 +2,8 @@ import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from models.rtmpose import RTMPose
-from data.yolo import YOLODataset
+
+from data.coco_pose import COCOPoseDataset
 import argparse
 import torch.nn.functional as F
 import datetime
@@ -116,49 +117,36 @@ def train(item_dict):
     
     os.makedirs(work_dir, exist_ok=True)
 
-    
+    # Setup logging
+    log_file = os.path.join(work_dir, 'training_pose_log.txt')
+    def log(msg):
+        print(msg)
+        with open(log_file, 'a') as f:
+            f.write(msg + '\n')
+
     # Device selection: CUDA > MPS (Mac) > CPU
+    # ... (existing device logic is fine, but lets update prints to use log()) ...
     if torch.cuda.is_available():
         device = torch.device('cuda')
-        print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Training on device: {device}")
-        print(f"GPU: {torch.cuda.get_device_name(0)}")
+        log(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Training on device: {device}")
+        log(f"GPU: {torch.cuda.get_device_name(0)}")
     elif torch.backends.mps.is_available():
         device = torch.device('mps')
-        print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Training on device: {device} (Apple Silicon GPU)")
+        log(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Training on device: {device} (Apple Silicon GPU)")
     else:
         device = torch.device('cpu')
-        print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Training on device: {device}")
+        log(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Training on device: {device}")
     
     # Dataset
-    # Split='train' handles getting images/labels from train folders
-    dataset = YOLODataset(data_root, split='train', use_pose=True)
+    img_dir = os.path.join(data_root, 'train', 'images')
+    ann_file = os.path.join(data_root, 'train', 'train.json')
     
-    # Collate: handle variable size or just stack if resize is done in dataset?
-    # Our YOLODataset currently doesn't resize images to fixed size!
-    # The Model expects fixed size (e.g. 256x192).
-    # We NEED a transform to resize image and keypoints!
+    # Transform
+    # Pass transform to dataset
+    dataset = COCOPoseDataset(img_dir, ann_file, transform=CropPersonTransform(size=(192, 256), padding_ratio=0.25))
     
-    # For now, let's add a simple resize transform inline or in dataset
-    # But for robustness, let's rely on a proper transform.
-    # To keep this "Scratch" simple, I'll modify collate to resize or assume user pre-resized?
-    # No, model needs fixed input.
-    # I will add a resize logic to the Dataset `__getitem__` if transform is None.
-    
-    # Actually, let's define a simple transform here
-    import cv2
-    import numpy as np
-    
-    # Transform defined globally now
-
-    # Pass transform to dataset? Dataset supports it.
-    # Re-instantiate with transform
-    dataset.transform = CropPersonTransform(size=(192, 256), padding_ratio=0.25)
-    
-    # Collate defined globally now
-        
-    # When using RAM Cache on Windows, num_workers must be 0 to avoid expensive pickling of the huge dataset object
-    num_workers = 0 if dataset.cache_ram else 4
-    persistent_workers = False if num_workers == 0 else True
+    num_workers = 4
+    persistent_workers = True
 
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn,
                             num_workers=num_workers, pin_memory=True, persistent_workers=persistent_workers)
@@ -167,53 +155,40 @@ def train(item_dict):
     model = RTMPose('s', input_size=(256, 192)).to(device)
     
     if resume_path and os.path.exists(resume_path):
-        print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Resuming from {resume_path}...")
+        log(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Resuming from {resume_path}...")
         try:
-            model.load_state_dict(torch.load(resume_path, map_location=device))
+            checkpoint = torch.load(resume_path, map_location=device)
+            if isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
+                 model.load_state_dict(checkpoint['state_dict'])
+                 log("Resumed model weights from dict checkpoint.")
+            else:
+                 model.load_state_dict(checkpoint)
+                 log("Resumed from weights-only checkpoint.")
         except Exception as e:
-            print(f"Warning: Failed to resume: {e}")
+            log(f"Warning: Failed to resume: {e}")
             
     model.train()
     
-    optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=0.05)
+    # Learning rate from args
+    lr = item_dict.get('lr', 0.001)
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=0.05)
     
-    # SimCC Loss Logic (KL Div)
-    # We need to turn GT keypoints into SimCC targets (1D Vectors)
-    def simcc_loss(pred_simcc_x, pred_simcc_y, gt_kpts, simcc_split_ratio=2.0, sigma=6.0):
-        # gt_kpts: (B, K, 3)
-        B, K, W_bins = pred_simcc_x.shape
-        _, _, H_bins = pred_simcc_y.shape
-        
-        # Generate generic 1D Gaussian targets
-        # ... Implementation of label smoothing/Gaussian generation on 1D ...
-        
-        # Simplified: Cross Entropy with "One Hot" or "Soft Label" of coordinate index
-        # x_loc = gt_x * split_ratio
-        
-        loss = 0
-        valid_mask = gt_kpts[..., 2] > 0
-        
-        if valid_mask.sum() == 0:
-             return torch.tensor(0.0, device=device, requires_grad=True)
-             
-        # Create targets
-        gt_x = gt_kpts[..., 0] * simcc_split_ratio
-        gt_y = gt_kpts[..., 1] * simcc_split_ratio
-        
-        # Clip to bins
-        gt_x = gt_x.clamp(0, W_bins-1).long()
-        gt_y = gt_y.clamp(0, H_bins-1).long()
-        
-        # Simple Cross Entropy for classification
-        # Flatten
-        loss_x = F.cross_entropy(pred_simcc_x.permute(0, 2, 1), gt_x, reduction='none')
-        loss_y = F.cross_entropy(pred_simcc_y.permute(0, 2, 1), gt_y, reduction='none')
-        
-        loss = (loss_x * valid_mask + loss_y * valid_mask).sum() / (valid_mask.sum() + 1e-6)
-        return loss
-
-    print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Starting Pose Training...")
-    for epoch in range(epochs):
+    start_epoch = 0
+    if resume_path and os.path.exists(resume_path):
+        try:
+            checkpoint = torch.load(resume_path, map_location=device)
+            if isinstance(checkpoint, dict):
+                if 'optimizer' in checkpoint:
+                     optimizer.load_state_dict(checkpoint['optimizer'])
+                     log("Resumed optimizer state.")
+                if 'epoch' in checkpoint:
+                     start_epoch = checkpoint['epoch']
+                     log(f"Resuming training from epoch {start_epoch + 1}.")
+        except:
+            pass
+    
+    log(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Starting Pose Training from epoch {start_epoch + 1}...")
+    for epoch in range(start_epoch, epochs):
         total_loss = 0
         for i, (imgs, gt_kpts) in enumerate(dataloader):
             imgs = imgs.to(device)
@@ -227,6 +202,10 @@ def train(item_dict):
             loss = simcc_loss(pred_x, pred_y, gt_kpts)
             
             loss.backward()
+            
+            # Gradient Clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            
             optimizer.step()
             
             total_loss += loss.item()
@@ -234,13 +213,24 @@ def train(item_dict):
             if i % 10 == 0:
                 print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Epoch [{epoch+1}/{epochs}], Step [{i}/{len(dataloader)}], Loss: {loss.item():.4f}")
                 
-        print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Epoch {epoch+1} Complete. Avg Loss: {total_loss/len(dataloader):.4f}")
+        avg_loss = total_loss/len(dataloader)
+        log(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Epoch {epoch+1} Complete. Avg Loss: {avg_loss:.4f}")
         
         # Save every epoch
-        save_path = os.path.join(work_dir, 'rtmpose_custom.pth')
-        torch.save(model.state_dict(), save_path)
+        ckpt_name = f'rtmpose_custom_epoch_{epoch+1}.pth'
+        save_path = os.path.join(work_dir, ckpt_name)
+        checkpoint = {
+            'epoch': epoch + 1,
+            'state_dict': model.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'loss': avg_loss
+        }
+        torch.save(checkpoint, save_path)
         
-    print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Pose Training Complete. Model saved to {save_path}.")
+        # Latest
+        torch.save(checkpoint, os.path.join(work_dir, 'rtmpose_custom.pth'))
+        
+    log(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Pose Training Complete. Model saved to {save_path}.")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -249,6 +239,7 @@ if __name__ == "__main__":
     parser.add_argument('--epochs', type=int, default=50) # Increased to 50
     parser.add_argument('--resume', type=str, default=None, help='Path to checkpoint to resume from')
     parser.add_argument('--work_dir', type=str, default='train/weights', help='Directory to save weights')
+    parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate')
     args = parser.parse_args()
     
     train(vars(args))

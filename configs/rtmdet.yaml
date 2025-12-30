@@ -1,6 +1,7 @@
-# RTMDet Training Configuration (Object Detection)
-# Script: train_det.py
-# PURPOSE: Stabilize training on Apple MPS & eliminate mid-epoch NaNs
+# ==============================================================================
+# RTMDet Training Configuration (MPS-Safe, NaN-Stable)
+# Target: Mac Pro M5 | 24 GB RAM | Apple MPS
+# ==============================================================================
 
 detection:
   model:
@@ -11,41 +12,52 @@ detection:
     root: "dataset_coco"
     train_images: "train/images"
     train_annotations: "train/train.json"
-    batch_size: 4
-    num_workers: 0
+
+    # 🔒 Smaller batch = more stable on MPS
+    batch_size: 8
+
+    # MPS does not benefit from many workers
+    num_workers: 2
+    pin_memory: false
     persistent_workers: false
 
   training:
-    epochs: 100
-    device: "cuda"
-    work_dir: "train/weights_rtmdet_s_scratch"
-    resume: false
-    resume_from: null
+    epochs: 80
+    device: "mps"
+    work_dir: "train/weights_mps_safe"
 
-    # 🔒 Stabilization controls (Disabled for CUDA/Scratch)
-    freeze_backbone: false
-    freeze_at_epoch: 0
+    # 🔒 Critical: disable mixed precision
+    fp16: false
+    amp: false
+
+    # 🔒 Critical: avoid MPS gradient accumulation bug
+    accumulate_grad_batches: 1
+
+    # Resume-safe
+    resume_from: "auto"   # or explicit checkpoint path
 
   optimization:
-    optimizer: "AdamW"
+    # 🔒 AdamW is unstable on MPS → switch to SGD
+    optimizer: "SGD"
 
     learning_rate:
-      base_lr: 1.0e-3            # Increased for CUDA
+      base_lr: 5.0e-3     # SGD-friendly LR
+      warmup_steps: 2000
       scheduler: "CosineAnnealing"
-      warmup_steps: 300
-      min_lr: 1.0e-6
 
-    weight_decay: 0.05
-    gradient_clipping: 1.0       # Standard clipping
+    momentum: 0.9
+    weight_decay: 5.0e-4
 
-    # 🔕 Mixed precision (Can enable on CUDA)
-    fp16: true
-    amp: true
+    # 🔒 Stronger clipping (very important)
+    gradient_clipping: 0.5
 
-  # 🚫 Augmentation stabilizers
   augmentation:
-    mosaic_prob: 0.0             # Disable Mosaic immediately
-    close_mosaic_epochs: 40
+    # 🔒 Disable unstable augmentations on MPS
+    mosaic_prob: 0.0
     mixup_prob: 0.0
+    random_affine: false
 
-
+  runtime:
+    # 🔒 Determinism helps reduce NaNs
+    cudnn_benchmark: false
+    cudnn_deterministic: true

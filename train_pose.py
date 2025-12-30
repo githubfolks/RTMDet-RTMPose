@@ -195,12 +195,14 @@ def train(item_dict):
     img_dir = os.path.join(data_root, 'train', 'images')
     ann_file = os.path.join(data_root, 'train', 'train.json')
     
-    # Transform
-    # Pass transform to dataset
     dataset = COCOPoseDataset(img_dir, ann_file, transform=CropPersonTransform(size=(192, 256), padding_ratio=0.25))
     
-    num_workers = 4
-    persistent_workers = True
+    num_workers = item_dict.get('num_workers', 0)
+    persistent_workers = item_dict.get('persistent_workers', False)
+    
+    # On Windows, persistent_workers=True with num_workers>0 can sometimes cause hangs
+    if num_workers == 0:
+        persistent_workers = False
 
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn,
                             num_workers=num_workers, pin_memory=True, persistent_workers=persistent_workers)

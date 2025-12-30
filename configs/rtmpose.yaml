@@ -9,16 +9,16 @@ pose:
     root: "dataset_coco"
     train_images: "train/images"
     train_annotations: "train/train.json"
-    batch_size: 4                    # Safe on 24GB M5
+    batch_size: 8                    # Safe on GPU
     num_workers: 0                    # Improve data pipeline throughput
-    persistent_workers: true
+    persistent_workers: false
     preprocessing:
       crop_padding_ratio: 0.25
 
   training:
-    epochs: 100                        # Enough with pretrained weights
-    device: "mps"
-    work_dir: "train/weights_rtmpose_s"
+    epochs: 200                        # Extended for better convergence
+    device: "cuda"
+    work_dir: "train/weights_rtmpose_s_cuda"
     pretrained: true
     load_from: "rtmpose_s_simcc_coco.pth"
 

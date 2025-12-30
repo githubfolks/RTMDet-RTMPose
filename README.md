@@ -17,4 +17,7 @@ python train_pose.py --data_root custom_dataset_6000 --batch_size 8 --epochs 50
 
 python train_det.py --data_root custom_dataset_6000 --batch_size 4 --epochs 12 --device mps --resume train/weights/rtmdet_custom.pth
 
-python train_det.py --config configs/rtmdet.yaml --device cuda
+python train_det.py --config configs/rtmdet.yaml
+python train_pose.py --config configs/rtmpose.yaml
+
+train_pose.py --config configs/rtmpose.yaml --resume train/weights_rtmpose_s_cuda/rtmpose_custom_epoch_94.pth

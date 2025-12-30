@@ -252,13 +252,42 @@ def get_color_by_confidence(conf):
         return (0, 0, 255)  # Red
 
 
+def load_checkpoint(model, weights_path, device):
+    """Load weights robustly, handling state_dict keys."""
+    print(f"Loading from {weights_path}...")
+    try:
+        checkpoint = torch.load(weights_path, map_location=device, weights_only=False)
+        
+        if isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
+            # Handle MMDeploy/MMPose/Custom checkpoint dicts
+            state_dict = checkpoint['state_dict']
+            # Remove 'module.' prefix if present (DataParallel)
+            new_state_dict = {}
+            for k, v in state_dict.items():
+                if k.startswith('module.'):
+                    new_state_dict[k[7:]] = v
+                else:
+                    new_state_dict[k] = v
+            model.load_state_dict(new_state_dict)
+            print("  Loaded weights from 'state_dict' key.")
+        else:
+            # Direct state dict
+            model.load_state_dict(checkpoint)
+            print("  Loaded weights directly.")
+            
+    except Exception as e:
+        print(f"Error loading checkpoint: {e}")
+        raise e
+
+
+
 # ============================================
 # MAIN PROCESSING
 # ============================================
 
 def process_image(img, det_model, pose_model, device, 
                   score_thr=0.16, nms_thr=0.1, 
-                  show_pose_label=True, show_keypoints=True):
+                  show_pose_label=False, show_keypoints=True):
     """
     Process a single image for multi-person pose estimation.
     
@@ -292,18 +321,9 @@ def process_image(img, det_model, pose_model, device,
             if x1 < -2 or y1 < -2 or x2 > w_img + 2 or y2 > h_img + 2:
                 continue
         
-        # Refine bounding box
-        w, h = x2 - x1, y2 - y1
-        center_x = x1 + w / 2 + w * 0.2  # Shift right
-        new_w = w * 1.5
-        
-        x1_refined = int(center_x - new_w / 2)
-        x2_refined = int(center_x + new_w / 2)
-        y1_refined = y1 - int(h * 0.1)
-        y2_refined = y2 + int(h * 0.1)
-        
+        # Use raw detection box
         valid_boxes.append({
-            'bbox': (x1_refined, y1_refined, x2_refined, y2_refined),
+            'bbox': (x1, y1, x2, y2),
             'score': float(score)
         })
     
@@ -409,18 +429,18 @@ def process_image(img, det_model, pose_model, device,
             cv2.putText(vis_img, label, (label_x, label_y),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
     
-    # Add legend
-    legend_y = 30
-    cv2.putText(vis_img, f"Detected: {len(results)} person(s)", (10, legend_y), 
-               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-    
-    legend_y += 25
-    for pose_name, color in POSE_COLORS.items():
-        if pose_name != 'unknown':
-            cv2.rectangle(vis_img, (10, legend_y - 12), (25, legend_y + 3), color, -1)
-            cv2.putText(vis_img, pose_name.capitalize(), (30, legend_y), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
-            legend_y += 18
+    # Add legend (disabled)
+    # legend_y = 30
+    # cv2.putText(vis_img, f"Detected: {len(results)} person(s)", (10, legend_y), 
+    #            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+    # 
+    # legend_y += 25
+    # for pose_name, color in POSE_COLORS.items():
+    #     if pose_name != 'unknown':
+    #         cv2.rectangle(vis_img, (10, legend_y - 12), (25, legend_y + 3), color, -1)
+    #         cv2.putText(vis_img, pose_name.capitalize(), (30, legend_y), 
+    #                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+    #         legend_y += 18
     
     return vis_img, results
 
@@ -429,12 +449,12 @@ def main():
     parser = argparse.ArgumentParser(description='Multi-Person Pose Estimation with Action Classification')
     parser.add_argument('--input', type=str, default='sample_input', help='Input directory or image path')
     parser.add_argument('--output', type=str, default='sample_output', help='Output directory')
-    parser.add_argument('--det_weights', type=str, default='train/weights/rtmdet_custom.pth')
-    parser.add_argument('--pose_weights', type=str, default='train/weights/rtmpose_best.pth')
-    parser.add_argument('--score_thr', type=float, default=0.25)
-    parser.add_argument('--nms_thr', type=float, default=0.1)
+    parser.add_argument('--det_weights', type=str, default='train/weights_rtmdet_s_scratch/rtmdet_custom.pth')
+    parser.add_argument('--pose_weights', type=str, default='train/weights_rtmpose_s_cuda/rtmpose_custom_epoch_122.pth')
+    parser.add_argument('--score_thr', type=float, default=0.16)
+    parser.add_argument('--nms_thr', type=float, default=0.6)
     parser.add_argument('--no_keypoints', action='store_true', help='Hide keypoint visualization')
-    parser.add_argument('--no_pose_label', action='store_true', help='Hide pose classification label')
+    parser.add_argument('--show_pose_label', action='store_true', help='Show pose classification label')
     args = parser.parse_args()
     
     # Device selection
@@ -448,14 +468,13 @@ def main():
     print(f"Using device: {device}")
     
     # Load models
-    print(f"Loading RTMDet from {args.det_weights}...")
+    # Load models
     det_model = RTMDet('s').to(device)
-    det_model.load_state_dict(torch.load(args.det_weights, map_location=device))
+    load_checkpoint(det_model, args.det_weights, device)
     det_model.eval()
     
-    print(f"Loading RTMPose from {args.pose_weights}...")
     pose_model = RTMPose('s', input_size=(256, 192)).to(device)
-    pose_model.load_state_dict(torch.load(args.pose_weights, map_location=device))
+    load_checkpoint(pose_model, args.pose_weights, device)
     pose_model.eval()
     
     # Get image paths
@@ -486,7 +505,7 @@ def main():
             img, det_model, pose_model, device,
             score_thr=args.score_thr,
             nms_thr=args.nms_thr,
-            show_pose_label=not args.no_pose_label,
+            show_pose_label=args.show_pose_label,
             show_keypoints=not args.no_keypoints
         )
         

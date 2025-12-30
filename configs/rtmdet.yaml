@@ -16,7 +16,7 @@ detection:
     persistent_workers: false
 
   training:
-    epochs: 100
+    epochs: 200
     device: "cuda"
     work_dir: "train/weights_rtmdet_s_scratch"
     resume: false

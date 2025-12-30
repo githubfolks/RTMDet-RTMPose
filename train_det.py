@@ -214,7 +214,8 @@ def train(item_dict):
             
 
             loss = loss_dict['loss_cls'] + loss_dict['loss_bbox']
-            
+            loss = torch.clamp(loss, min=0.0, max=15.0)
+
             # Check for NaN loss and skip batch if detected
             if torch.isnan(loss) or torch.isinf(loss):
                 print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Warning: NaN/Inf loss detected at step {i}, skipping batch...")
@@ -224,20 +225,13 @@ def train(item_dict):
             
             loss.backward()
             
-            # Replace NaN/Inf gradients with zeros to allow partial learning
-            nan_grad_count = 0
-            for param in model.parameters():
-                if param.grad is not None:
-                    nan_mask = torch.isnan(param.grad) | torch.isinf(param.grad)
-                    if nan_mask.any():
-                        param.grad = torch.where(nan_mask, torch.zeros_like(param.grad), param.grad)
-                        nan_grad_count += 1
-            
-            if nan_grad_count > 0 and i % 100 == 0:
-                print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Fixed {nan_grad_count} NaN gradients at step {i}...")
-            
+            # 🔒 Sanitize gradients
+            for p in model.parameters():
+                if p.grad is not None:
+                    p.grad.data = torch.nan_to_num(p.grad.data, nan=0.0, posinf=0.0, neginf=0.0)
+
             # Gradient Clipping - more aggressive for stability
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
             
             optimizer.step()
             

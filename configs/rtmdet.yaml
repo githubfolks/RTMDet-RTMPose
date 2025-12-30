@@ -11,36 +11,36 @@ detection:
     root: "dataset_coco"
     train_images: "train/images"
     train_annotations: "train/train.json"
-    batch_size: 16
-    num_workers: 8
-    persistent_workers: true
+    batch_size: 4
+    num_workers: 0
+    persistent_workers: false
 
   training:
-    epochs: 80
-    device: "mps"
-    work_dir: "train/weights_rtmdet_s"
-    resume: true
-    resume_from: "train/weights_scratch/rtmdet_custom_epoch_46.pth"  # ← adjust if needed
+    epochs: 100
+    device: "cuda"
+    work_dir: "train/weights_rtmdet_s_scratch"
+    resume: false
+    resume_from: null
 
-    # 🔒 Stabilization controls
-    freeze_backbone: true        # CRITICAL: stop backbone gradient spikes
-    freeze_at_epoch: 45
+    # 🔒 Stabilization controls (Disabled for CUDA/Scratch)
+    freeze_backbone: false
+    freeze_at_epoch: 0
 
   optimization:
     optimizer: "AdamW"
 
     learning_rate:
-      base_lr: 1.5e-4            # Capped for MPS safety
+      base_lr: 1.0e-3            # Increased for CUDA
       scheduler: "CosineAnnealing"
       warmup_steps: 300
       min_lr: 1.0e-6
 
     weight_decay: 0.05
-    gradient_clipping: 0.3       # 🔥 MOST IMPORTANT FIX
+    gradient_clipping: 1.0       # Standard clipping
 
-    # 🔕 Disable mixed precision on MPS
-    fp16: false
-    amp: false
+    # 🔕 Mixed precision (Can enable on CUDA)
+    fp16: true
+    amp: true
 
   # 🚫 Augmentation stabilizers
   augmentation:

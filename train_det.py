@@ -104,8 +104,14 @@ def train(item_dict):
     # Collate function to handle list of tensors
     # Collate function defined globally now
         
-    num_workers = 4
-    persistent_workers = True
+    # Collate function defined globally now
+        
+    num_workers = item_dict.get('num_workers', 0)
+    persistent_workers = item_dict.get('persistent_workers', False)
+    
+    # On Windows, persistent_workers=True with num_workers>0 can sometimes cause hangs
+    if num_workers == 0:
+        persistent_workers = False
     
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn, 
                             num_workers=num_workers, pin_memory=True, persistent_workers=persistent_workers)

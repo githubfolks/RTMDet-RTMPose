@@ -9,14 +9,14 @@ pose:
     root: "dataset_coco"
     train_images: "train/images"
     train_annotations: "train/train.json"
-    batch_size: 16                    # Safe on 24GB M5
-    num_workers: 8                    # Improve data pipeline throughput
+    batch_size: 4                    # Safe on 24GB M5
+    num_workers: 0                    # Improve data pipeline throughput
     persistent_workers: true
     preprocessing:
       crop_padding_ratio: 0.25
 
   training:
-    epochs: 40                        # Enough with pretrained weights
+    epochs: 100                        # Enough with pretrained weights
     device: "mps"
     work_dir: "train/weights_rtmpose_s"
     pretrained: true

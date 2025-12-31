@@ -450,7 +450,7 @@ def main():
     parser.add_argument('--input', type=str, default='sample_input', help='Input directory or image path')
     parser.add_argument('--output', type=str, default='sample_output', help='Output directory')
     parser.add_argument('--det_weights', type=str, default='train/weights_rtmdet_s_scratch/rtmdet_custom.pth')
-    parser.add_argument('--pose_weights', type=str, default='train/weights_rtmpose_s_cuda/rtmpose_custom_epoch_122.pth')
+    parser.add_argument('--pose_weights', type=str, default='train/weights_rtmpose_s_cuda/rtmpose_custom.pth')
     parser.add_argument('--score_thr', type=float, default=0.16)
     parser.add_argument('--nms_thr', type=float, default=0.6)
     parser.add_argument('--no_keypoints', action='store_true', help='Hide keypoint visualization')
